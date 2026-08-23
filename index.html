@@ -703,32 +703,6 @@
   let ws;
   let alertHideTimer = null;
 
-  // ---------------- Alert sound (Web Audio API, works fully offline) ----------------
-  let audioCtx;
-  function beep(freq, startTime, durationSec) {
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.type = "square";
-    osc.frequency.value = freq;
-    gain.gain.setValueAtTime(0.45, startTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, startTime + durationSec);
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.start(startTime);
-    osc.stop(startTime + durationSec);
-  }
-  function playAlertSound() {
-    try {
-      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === "suspended") audioCtx.resume();
-      const now = audioCtx.currentTime;
-      beep(880, now, 0.15);
-      beep(880, now + 0.2, 0.15);
-    } catch (e) {
-      console.warn("Alert sound failed:", e);
-    }
-  }
-
   // ---------------- Obstacle alert ----------------
   function showObstacleAlert(side, cm) {
     const dir = side === "front" ? "ahead" : "behind";
@@ -789,14 +763,12 @@
         const cm = msg.split(":")[2];
         frontDistanceEl.textContent = cm + " cm";
         showObstacleAlert("front", cm);
-        playAlertSound();
         setActiveDpadButton(null);
 
       } else if (msg.startsWith("obstacle:rear:")) {
         const cm = msg.split(":")[2];
         rearDistanceEl.textContent = cm + " cm";
         showObstacleAlert("rear", cm);
-        playAlertSound();
         setActiveDpadButton(null);
 
       } else if (msg.startsWith("distance:front:")) {
