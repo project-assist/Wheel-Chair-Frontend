@@ -578,10 +578,10 @@
     <div class="settings-body">
 
       <div class="control-block">
-        <label for="turnDelay"><span>Turn delay</span><span class="val"><span id="turnDelayValue">230</span> ms</span></label>
-        <input type="range" id="turnDelay" min="50" max="2000" step="10" value="230" />
+        <label for="turnDelay"><span>Turn delay</span><span class="val"><span id="turnDelayValue">450</span> ms</span></label>
+        <input type="range" id="turnDelay" min="50" max="2000" step="10" value="450" />
         <div class="control-row">
-          <input type="number" id="turnDelayNumber" min="50" max="5000" step="10" value="230" />
+          <input type="number" id="turnDelayNumber" min="50" max="5000" step="10" value="450" />
           <button id="applyDelayBtn">Apply</button>
         </div>
         <div class="hint">How long a left/right turn runs before the chair auto-stops.</div>
@@ -654,8 +654,8 @@
 
   const WS_URL = "ws://192.168.4.1:81"; // ESP32 AP IP + WebSocket port
   const OBSTACLE_ALERT_DISPLAY_MS = 2500;
-  const DEFAULT_TURN_DELAY_MS = 230;
-  const DEFAULT_SPEED = 180;
+  const DEFAULT_TURN_DELAY_MS = 450;
+  const DEFAULT_SPEED = 180; // 180/255
   const DEFAULT_CONFIDENCE_PCT = 75;
 
   // ---------------- Element refs ----------------
@@ -880,12 +880,17 @@
     stop: "stop",
   };
   const VOICE_COMMAND_COOLDOWN_MS = 1200;
+  const VOICE_CONFIDENCE_FLOOR = 0.4; // matches <input id="confidence" min="40">
   const VOICE_MODEL_INDEXEDDB_KEY = "indexeddb://wheelchair-voice-model";
   const VOICE_MODEL_METADATA_KEY = "wheelchairVoiceModelMetadata";
 
+  const VOICE_WATCHDOG_TIMEOUT_MS = 5000; // fail-safe stop if recognition stalls mid-drive
   let recognizer = null;
   let isVoiceListening = false;
   let lastVoiceCommandAt = 0;
+  let lastRecognizerCallbackAt = 0;
+  let lastDrivingCommand = null; // tracks forward/backward/left/right while active; null once stopped
+  let watchdogTimer = null;
   let ringResetTimer = null;
 
   function setRingState(state) {
@@ -978,13 +983,16 @@
     voiceHeardWord.textContent = '"' + word + '" · ' + Math.round(confidence * 100) + "% confident";
 
     const now = Date.now();
-    if (now - lastVoiceCommandAt < VOICE_COMMAND_COOLDOWN_MS) return;
+    // "stop" must never be rate-limited — a delayed/dropped stop is a safety issue.
+    // Only non-stop commands are debounced against rapid re-triggering.
+    if (command !== "stop" && now - lastVoiceCommandAt < VOICE_COMMAND_COOLDOWN_MS) return;
     lastVoiceCommandAt = now;
 
     sendCommand(command);
     setActiveDpadButton(command);
     setRingState("heard");
     voiceStateLabel.textContent = command === "stop" ? "Stopped" : "Driving: " + command;
+    lastDrivingCommand = command === "stop" ? null : command;
 
     clearTimeout(ringResetTimer);
     ringResetTimer = setTimeout(() => {
@@ -1001,6 +1009,56 @@
   // we run inference with a short overlap window + WebGL backend so
   // recognition stays low-latency. suppressionTimeMillis keeps repeat
   // triggers from queuing up and adding lag.
+  // ---- Screen wake lock: mobile browsers throttle/suspend background tabs
+  // (and can pause mic processing) once the screen dims or sleeps. This app
+  // runs continuously while mounted on the chair, so keep the screen awake
+  // for as long as voice control is active. Re-acquired on visibilitychange
+  // because the OS releases the lock automatically when a tab backgrounds.
+  let wakeLock = null;
+  async function requestWakeLock() {
+    if (!("wakeLock" in navigator)) return;
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+    } catch (e) {
+      console.warn("Wake lock unavailable:", e);
+    }
+  }
+  function releaseWakeLock() {
+    if (wakeLock) {
+      wakeLock.release().catch(() => {});
+      wakeLock = null;
+    }
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (isVoiceListening && document.visibilityState === "visible" && !wakeLock) {
+      requestWakeLock();
+    }
+  });
+
+  // ---- Watchdog: if the recognizer stops delivering callbacks (WebGL
+  // context loss, stalled audio pipeline, tab throttling) while the chair
+  // is actively driving, the chair would otherwise keep moving with no way
+  // to stop it by voice. Force a stop if too much time passes with no
+  // recognizer callback while a non-stop command is outstanding.
+  function startVoiceWatchdog() {
+    stopVoiceWatchdog();
+    watchdogTimer = setInterval(() => {
+      if (!isVoiceListening || !lastDrivingCommand) return;
+      if (Date.now() - lastRecognizerCallbackAt > VOICE_WATCHDOG_TIMEOUT_MS) {
+        console.warn("Voice watchdog: recognizer stalled, forcing stop");
+        sendCommand("stop");
+        setActiveDpadButton(null);
+        lastDrivingCommand = null;
+        voiceStateLabel.textContent = "Stopped (recognition stalled)";
+        setRingState(isVoiceListening ? "listening" : "idle");
+      }
+    }, 1000);
+  }
+  function stopVoiceWatchdog() {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+
   async function startVoiceListening() {
     if (!recognizer || isVoiceListening) return;
     const words = recognizer.wordLabels();
@@ -1019,6 +1077,7 @@
           }
           const label = words[bestIdx];
           const confidence = scores[bestIdx];
+          lastRecognizerCallbackAt = Date.now(); // watchdog heartbeat
 
           // live mic amplitude ring (rough proxy: peak score across all classes)
           let peak = 0;
@@ -1031,17 +1090,26 @@
         },
         {
           includeSpectrogram: false,
-          probabilityThreshold: voiceConfidenceThreshold,
+          // Fixed floor (matches the slider's min=40%), NOT the live variable.
+          // The library reads this option once, at listen()-call time, and
+          // can't see later slider changes. The real, always-current gate is
+          // the `confidence >= voiceConfidenceThreshold` check below — this
+          // floor only exists so the library invokes the callback at all.
+          probabilityThreshold: VOICE_CONFIDENCE_FLOOR,
           invokeCallbackOnNoiseAndUnknown: false,
           overlapFactor: 0.75,          // higher overlap = more frequent inference = lower latency
           suppressionTimeMillis: 400,   // avoid redundant back-to-back triggers of the same word
         }
       );
       isVoiceListening = true;
+      lastRecognizerCallbackAt = Date.now();
+      lastDrivingCommand = null;
       voiceToggleBtn.textContent = "Stop listening";
       voiceToggleBtn.classList.add("listening-state");
       setRingState("listening");
       updateVoiceStatusIdleLabel();
+      requestWakeLock();
+      startVoiceWatchdog();
     } catch (e) {
       voiceSubStatus.textContent = "Microphone error: " + e.message;
     }
@@ -1052,11 +1120,14 @@
       recognizer.stopListening();
     }
     isVoiceListening = false;
+    lastDrivingCommand = null;
     voiceToggleBtn.textContent = "Start listening";
     voiceToggleBtn.classList.remove("listening-state");
     ampRing.style.transform = "scale(1)";
     setRingState("idle");
     updateVoiceStatusIdleLabel();
+    releaseWakeLock();
+    stopVoiceWatchdog();
   }
 
   voiceToggleBtn.addEventListener("click", () => {
